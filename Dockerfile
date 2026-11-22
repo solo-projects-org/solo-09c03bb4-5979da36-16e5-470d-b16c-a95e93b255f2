@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PERIODICALS_DB=/data/periodicals.sqlite3
+    PERIODICALS_DB=/data/periodicals.sqlite3 \
+    MAX_CONTENDED_ISSUES=24
 
 WORKDIR /srv/app
 

@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import config, db, service
 from .schemas import BatchSubmit, VolumeCreate
 from .solver import MAX_CANDIDATES_PER_COPY, MAX_ISSUES
 
@@ -24,20 +24,28 @@ def _db_path() -> Path:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast on an unusable cap instead of at the first request.
+    max_contended = config.max_contended_issues()
     path = _db_path()
     db.init_db(path)
     app.state.db_path = path
+    app.state.max_contended = max_contended
     yield
 
 
 app = FastAPI(
     title="期刊补缺核对 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "给一卷旧期刊补缺前，把「有藏 / 缺刊 / 待翻册」分清楚。\n\n"
         "* 一卷最多 24 期，按条码成批增补或更正馆藏。\n"
         f"* 每册最多 {MAX_CANDIDATES_PER_COPY} 组候选期次；每组内期次必须一并计入。\n"
+        "* 只有出现在至少两册候选中的「争用期次」才分配互斥 DP 状态，"
+        "其余期次按唯一可能持有的册的可行候选判定；争用期数上限可配置"
+        "（环境变量 MAX_CONTENDED_ISSUES，默认 24），超限只报 507 资源不足、"
+        "不写馆藏或批次回执。\n"
         "* 所有合法方案都覆盖的期次为「有藏」，都未覆盖的为「缺刊」，其余为「待翻册」。\n"
+        "* 查卷、查缺刊检查现行馆藏；试算与提交同时检查批次前后两份馆藏。\n"
         "* 一批改动与其余馆藏一起核对；无解则整批退回，并保留原馆藏与审计记录。\n"
         "* 并发提交以实际入库（提交）顺序为准。"
     ),
@@ -47,10 +55,10 @@ app = FastAPI(
 
 @app.exception_handler(service.ApiError)
 async def _api_error_handler(request: Request, exc: service.ApiError):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}},
-    )
+    content: dict = {"error": {"code": exc.code, "message": exc.message}}
+    if exc.details:
+        content["error"]["details"] = exc.details
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 def get_conn(request: Request):
@@ -65,8 +73,12 @@ Conn = Annotated[sqlite3.Connection, Depends(get_conn)]
 
 
 @app.get("/healthz", tags=["system"])
-def healthz():
-    return {"status": "ok", "max_issues": MAX_ISSUES}
+def healthz(request: Request):
+    return {
+        "status": "ok",
+        "max_issues": MAX_ISSUES,
+        "max_contended_issues": config.max_contended_issues(),
+    }
 
 
 @app.post("/volumes", status_code=201, tags=["volumes"])

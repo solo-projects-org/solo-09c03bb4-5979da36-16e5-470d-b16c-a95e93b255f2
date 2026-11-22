@@ -7,6 +7,9 @@ services:
       - "8000:8000"
     environment:
       PERIODICALS_DB: /data/periodicals.sqlite3
+      # 争用期次（出现在至少两册候选中的期次）数量上限；求解状态空间为 2^上限。
+      # 小内存主机可调低，例如 12；默认 24 与卷期次上限一致。
+      MAX_CONTENDED_ISSUES: ${MAX_CONTENDED_ISSUES:-24}
     volumes:
       - periodical-data:/data
     restart: unless-stopped

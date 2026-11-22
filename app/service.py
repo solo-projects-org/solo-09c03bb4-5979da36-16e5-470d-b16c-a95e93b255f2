@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
-from . import db
+from . import config, db
 from .solver import (
     HELD,
     MAX_CANDIDATES_PER_COPY,
     MAX_ISSUES,
     MISSING,
     REVIEW,
+    ContentionLimitExceeded,
     Evaluation,
     evaluate,
 )
@@ -28,11 +29,18 @@ _BATCH_STATUSES = ("committed", "rejected")
 
 
 class ApiError(Exception):
-    def __init__(self, status_code: int, code: str, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 @dataclass(slots=True)
@@ -132,6 +140,54 @@ def get_volume_state(conn: sqlite3.Connection, volume_id: int) -> VolumeState:
     )
 
 
+def _evaluate(
+    volume: VolumeState,
+    groups: list[list[int]] | None = None,
+    *,
+    phase: str,
+    want_assignment: bool = True,
+) -> Evaluation:
+    """Run the solver with the configured cap, mapping cap errors to 507."""
+    issue_count = volume.issue_count
+    candidate_groups = (
+        groups if groups is not None else [copy.groups for copy in volume.copies]
+    )
+    cap = config.max_contended_issues()
+    try:
+        return evaluate(
+            issue_count,
+            candidate_groups,
+            want_assignment=want_assignment,
+            max_contended=cap,
+        )
+    except ContentionLimitExceeded as exc:
+        # Attach the contended issue labels for the error body.
+        from .solver import contended_issue_mask
+
+        mask = contended_issue_mask(candidate_groups)
+        labels = [
+            volume.issue_labels[i]
+            for i in range(issue_count)
+            if (mask >> i) & 1
+        ]
+        error = ApiError(
+            507,
+            "contention_limit_exceeded",
+            (
+                f"资源不足：争用期次有 {exc.contended_count} 期，超过本机上限 "
+                f"{exc.max_contended} 期；本次不写馆藏或批次回执"
+            ),
+            details={
+                "phase": phase,
+                "contended_count": exc.contended_count,
+                "max_contended": exc.max_contended,
+                "state_space_size": 1 << exc.contended_count,
+                "contended_issues": labels,
+            },
+        )
+        raise error from exc
+
+
 def _describe(evaluation: Evaluation, volume: VolumeState) -> dict:
     grouped: dict[str, list[str]] = {HELD: [], MISSING: [], REVIEW: []}
     for index, status in enumerate(evaluation.statuses):
@@ -147,15 +203,17 @@ def _describe(evaluation: Evaluation, volume: VolumeState) -> dict:
             "review": len(grouped[REVIEW]),
         },
         "labels_zh": STATUS_LABELS,
+        "contended_issues": [
+            volume.issue_labels[index] for index in evaluation.contended_issues
+        ],
+        "contended_count": evaluation.contended_count,
+        "state_space_size": evaluation.state_space_size,
+        "max_contended": evaluation.max_contended,
     }
 
 
 def reconcile(volume: VolumeState, *, want_assignment: bool = True) -> Evaluation:
-    return evaluate(
-        volume.issue_count,
-        [copy.groups for copy in volume.copies],
-        want_assignment=want_assignment,
-    )
+    return _evaluate(volume, phase="current_holdings", want_assignment=want_assignment)
 
 
 def volume_snapshot(volume: VolumeState) -> dict:
@@ -558,8 +616,10 @@ def submit_batch(
             if not before_eval.satisfiable:
                 raise ApiError(500, "holdings_inconsistent", "persisted holdings are not reconcilable")
             before = _describe(before_eval, volume)
-            after_eval = evaluate(
-                volume.issue_count, [copy.groups for copy in plan.merged]
+            after_eval = _evaluate(
+                volume,
+                [copy.groups for copy in plan.merged],
+                phase="batch_preview_after",
             )
             if not after_eval.satisfiable:
                 return (
@@ -630,7 +690,11 @@ def submit_batch(
                 "persisted holdings are not reconcilable; database was modified externally",
             )
         before = _describe(before_eval, volume)
-        after_eval = evaluate(volume.issue_count, [copy.groups for copy in plan.merged])
+        after_eval = _evaluate(
+            volume,
+            [copy.groups for copy in plan.merged],
+            phase="batch_submit_after",
+        )
         if not after_eval.satisfiable:
             reason = after_eval.reason or "no assignment of candidate groups is disjoint"
             record = _store_rejected(conn, plan, items, reason, before)
